@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>monoruby — Performance vs YJIT</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 2em;
+    max-width: 1100px;
+    color: #1a1a1a;
+  }
+  h1 { margin-bottom: 0.2em; }
+  .meta { color: #666; font-size: 0.9em; margin-bottom: 2em; }
+  section { margin-bottom: 3em; }
+  canvas { max-width: 100%; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9em; }
+  th, td { padding: 4px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { text-align: right; }
+  td { text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  td.reason { text-align: left; color: #c62828; font-weight: 600; font-size: 0.85em; }
+  td.err { color: #c62828; font-weight: 600; }
+  thead th { border-bottom: 2px solid #888; }
+  a { color: #1565c0; }
+  .empty { color: #888; padding: 1em 0; }
+</style>
+</head>
+<body>
+<h1>monoruby × ruby <code>--yjit</code></h1>
+<div class="meta">
+  Per-benchmark relative speed against <code>ruby 4.0.1 --yjit</code>, measured on every <code>master</code> push with
+  <a href="https://github.com/Shopify/yjit-bench">Shopify/yjit-bench</a> (<code>--rss --harness=harness-warmup</code>).
+  Each benchmark process is bounded with <code>timeout(1)</code>; benchmarks that crash or time out are listed in red with the cause.
+  Source: <a href="latest.json">latest.json</a>, <a href="data/history.csv">history.csv</a>. Back to <a href="../">portal</a>.
+</div>
+
+<section>
+  <h2>Latest snapshot</h2>
+  <div id="latestMeta" class="meta"></div>
+  <div id="latestBarWrap" style="position: relative;"><canvas id="latestBar"></canvas></div>
+  <table id="latestTable">
+    <thead>
+      <tr>
+        <th>Benchmark</th>
+        <th>monoruby (ms)</th>
+        <th>YJIT (ms)</th>
+        <th>YJIT / monoruby</th>
+        <th>monoruby reason</th>
+        <th>yjit reason</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <div id="empty" class="empty" hidden>No benchmark data yet. The next master push will populate this page.</div>
+</section>
+
+<script>
+async function loadJson(path) {
+  const res = await fetch(path + "?t=" + Date.now());
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+(async () => {
+  const data = await loadJson("latest.json");
+  const empty = document.getElementById("empty");
+  const benches = (data && data.benchmarks) || [];
+
+  if (!benches.length) {
+    empty.hidden = false;
+    return;
+  }
+
+  // Bar chart sort: ratio DESC, monoruby-failed at the bottom.
+  const sortKey = b => {
+    if (b.monoruby_failed) return -1;
+    if (b.yjit_failed)     return Infinity;
+    return b.ratio;
+  };
+  benches.sort((a, b) => sortKey(b) - sortKey(a));
+
+  const tos = (data.timeouts) || {};
+  const meta = "snapshot: " + data.timestamp + " @ " + data.commit
+    + (tos.monoruby ? " (timeouts: monoruby " + tos.monoruby + "s, yjit " + tos.yjit + "s)" : "");
+  document.getElementById("latestMeta").textContent = meta;
+
+  const okBars = benches.filter(b => !b.monoruby_failed && !b.yjit_failed);
+  const maxRatio = okBars.reduce((m, b) =>
+    (b.ratio && b.ratio > m) ? b.ratio : m, 1.5);
+
+  const barColor = b => {
+    const r = b.ratio || 0;
+    if (r >= 1.0) return "#2e7d32";
+    if (r >= 0.7) return "#9ccc65";
+    if (r >= 0.4) return "#fdd835";
+    return "#c62828";
+  };
+
+  const failed = b => b.monoruby_failed || b.yjit_failed;
+
+  // For failed runs, surface what went wrong with which side.
+  const failureText = b => {
+    const parts = [];
+    if (b.monoruby_failed) parts.push("monoruby: " + (b.monoruby_reason || "failed"));
+    if (b.yjit_failed)     parts.push("yjit: "     + (b.yjit_reason     || "failed"));
+    return parts.join("  /  ");
+  };
+
+  document.getElementById("latestBarWrap").style.height =
+    Math.max(280, benches.length * 26) + "px";
+
+  // Plugin draws the failure reason as text inside the chart area for
+  // benchmarks where either implementation didn't produce a result.
+  // No bar is drawn for those rows (data is 0).
+  const failureTextPlugin = {
+    id: "failureText",
+    afterDatasetsDraw(chart) {
+      const { ctx, scales: { x: xs, y: ys }, chartArea } = chart;
+      ctx.save();
+      ctx.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+      ctx.fillStyle = "#c62828";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      benches.forEach((b, i) => {
+        if (!failed(b)) return;
+        const y = ys.getPixelForValue(i);
+        const x = chartArea.left + 8;
+        ctx.fillText(failureText(b), x, y);
+      });
+      ctx.restore();
+    },
+  };
+
+  new Chart(document.getElementById("latestBar"), {
+    type: "bar",
+    data: {
+      labels: benches.map(b => b.name),
+      datasets: [{
+        label: "YJIT / monoruby",
+        data: benches.map(b => failed(b) ? 0 : (b.ratio || 0)),
+        backgroundColor: benches.map(b => failed(b) ? "transparent" : barColor(b)),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          beginAtZero: true,
+          suggestedMax: Math.max(2.0, maxRatio),
+          title: { display: true, text: "relative speed (× YJIT, higher = monoruby faster)" },
+          grid: {
+            color: ctx => ctx.tick.value === 1 ? "#1a1a1a" : "rgba(0,0,0,0.08)",
+            lineWidth: ctx => ctx.tick.value === 1 ? 2 : 1,
+          },
+        },
+        y: { ticks: { autoSkip: false, font: { size: 11 } } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => {
+              const b = benches[ctx.dataIndex];
+              if (failed(b)) {
+                const lines = [];
+                if (b.monoruby_failed) lines.push("monoruby: " + (b.monoruby_reason || "failed"));
+                if (b.yjit_failed)     lines.push("yjit: "     + (b.yjit_reason     || "failed"));
+                if (!b.monoruby_failed) lines.unshift("monoruby: " + b.monoruby_ms.toFixed(2) + " ms");
+                if (!b.yjit_failed)     lines.unshift("yjit: "     + b.yjit_ms.toFixed(2) + " ms");
+                return lines;
+              }
+              return [
+                ctx.parsed.x.toFixed(2) + "× YJIT",
+                "monoruby: " + b.monoruby_ms.toFixed(2) + " ms",
+                "yjit:     " + b.yjit_ms.toFixed(2) + " ms",
+              ];
+            },
+          },
+        },
+      },
+    },
+    plugins: [failureTextPlugin],
+  });
+
+  const tbody = document.querySelector("#latestTable tbody");
+  const numCell = (v, fail) => {
+    const td = document.createElement("td");
+    if (fail) { td.textContent = "ERROR"; td.className = "err"; }
+    else      { td.textContent = v; }
+    return td;
+  };
+  const reasonCell = text => {
+    const td = document.createElement("td");
+    if (text) {
+      td.textContent = text;
+      td.className = "reason";
+    } else {
+      td.textContent = "";
+    }
+    return td;
+  };
+  for (const b of benches) {
+    const tr = document.createElement("tr");
+    const nameTd = document.createElement("td");
+    nameTd.textContent = b.name;
+    tr.appendChild(nameTd);
+    tr.appendChild(numCell(b.monoruby_ms != null ? b.monoruby_ms.toFixed(3) : "", b.monoruby_failed));
+    tr.appendChild(numCell(b.yjit_ms != null ? b.yjit_ms.toFixed(3) : "", b.yjit_failed));
+    tr.appendChild(numCell(b.ratio != null ? b.ratio.toFixed(3) + "x" : "", b.ratio == null));
+    tr.appendChild(reasonCell(b.monoruby_failed ? (b.monoruby_reason || "failed") : ""));
+    tr.appendChild(reasonCell(b.yjit_failed     ? (b.yjit_reason     || "failed") : ""));
+    tbody.appendChild(tr);
+  }
+})();
+</script>
+</body>
+</html>
